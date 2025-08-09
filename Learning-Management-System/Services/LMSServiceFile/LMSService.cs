@@ -40,7 +40,8 @@ namespace Learning_Management_System.Services.LMSServiceFile
         {
             var course = _mapper.Map<Course>(dto);
             var created = await _repository.AddCourseAsync(course);
-            return _mapper.Map<CourseDetailDto>(created);
+            var createdFull = await _repository.GetCourseByIdAsync(created.Id);
+            return _mapper.Map<CourseDetailDto>(createdFull);
         }
 
         public async Task<bool> UpdateCourseAsync(int id, CourseUpdateDto dto)

@@ -15,7 +15,11 @@ namespace Learning_Management_System.Repositories.LMS
 
         // ----- Courses -----
         public async Task<IEnumerable<Course>> GetAllCoursesAsync()
-            => await _context.Courses.Include(c => c.Instructor).ToListAsync();
+        {
+            return await _context.Courses
+                .Include(c => c.Instructor) 
+                .ToListAsync();
+        }
 
         public async Task<Course?> GetCourseByIdAsync(int id)
             => await _context.Courses.Include(c => c.Lessons).Include(c => c.Quizzes).Include(c => c.Instructor).FirstOrDefaultAsync(c => c.Id == id);

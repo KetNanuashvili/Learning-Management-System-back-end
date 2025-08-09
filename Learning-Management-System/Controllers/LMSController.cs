@@ -8,9 +8,13 @@ using Learning_Management_System.Services.Interfaces;
 using Learning_Management_System.Services.LMSServiceFile;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using System.Security.Claims;
 
 namespace Learning_Management_System.Controllers
 {
+
+
+
     [ApiController]
     [Route("api/[controller]")]
     public class LMSController : ControllerBase
@@ -60,26 +64,56 @@ namespace Learning_Management_System.Controllers
         public async Task<IActionResult> DeleteCourse(int id)
         {
             var success = await _lmsService.DeleteCourseAsync(id);
-            return success ? NoContent() : NotFound();
+            return success
+                ? Ok(new { message = "Course deleted successfully", id })
+                : NotFound(new { message = "Course not found" });
         }
 
+
         // ----- Enrollment -----
+        private int GetUserIdFromToken()
+        {
+            // სცადე სტანდარტული NameIdentifier, მერე "sub"
+            var id = User.FindFirst(ClaimTypes.NameIdentifier)?.Value
+                     ?? User.FindFirst("sub")?.Value;
+            if (string.IsNullOrWhiteSpace(id))
+                throw new UnauthorizedAccessException("User id was not found in token.");
+            return int.Parse(id);
+        }
 
         [HttpPost("enroll")]
         [Authorize(Roles = "Student")]
-        public async Task<IActionResult> EnrollStudent([FromBody] EnrollRequestDto dto, [FromQuery] int studentId)
+        public async Task<IActionResult> EnrollSelf([FromBody] EnrollRequestDto dto)
         {
-            var success = await _lmsService.EnrollStudentAsync(dto, studentId);
-            return success ? Ok() : Conflict("Student is already enrolled.");
+            var studentId = GetUserIdFromToken();
+            var ok = await _lmsService.EnrollStudentAsync(dto, studentId);
+            return ok ? Ok() : Conflict("Student is already enrolled.");
+        }
+
+        [HttpPost("enroll/for")]
+        [Authorize(Roles = "Admin,Instructor")]
+        public async Task<IActionResult> EnrollFor([FromBody] EnrollRequestDto dto, [FromQuery] int studentId)
+        {
+            var ok = await _lmsService.EnrollStudentAsync(dto, studentId);
+            return ok ? Ok() : Conflict("Student is already enrolled.");
+        }
+
+        [HttpGet("enrollments/me")]
+        [Authorize(Roles = "Student")]
+        public async Task<ActionResult<IEnumerable<EnrollmentDto>>> GetMyEnrollments()
+        {
+            var studentId = GetUserIdFromToken();
+            var list = await _lmsService.GetUserEnrollmentsAsync(studentId);
+            return Ok(list);
         }
 
         [HttpGet("enrollments/{studentId}")]
-        [Authorize(Roles = "Student")]
+        [Authorize(Roles = "Admin,Instructor")]
         public async Task<ActionResult<IEnumerable<EnrollmentDto>>> GetUserEnrollments(int studentId)
         {
-            return Ok(await _lmsService.GetUserEnrollmentsAsync(studentId));
+            var list = await _lmsService.GetUserEnrollmentsAsync(studentId);
+            return Ok(list);
         }
-
         // ----- Lessons -----
 
         [HttpPost("lessons")]

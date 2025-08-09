@@ -2,80 +2,125 @@
 using Learning_Management_System.Models;
 using Learning_Management_System.Repositories.LMS;
 using Learning_Management_System.Services;
-
 using Learning_Management_System.Services.AuthServiceFile;
 using Learning_Management_System.Services.Interfaces;
 using Learning_Management_System.Services.LMSServiceFile;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
+using System.Text;using Learning_Management_System.Mapping;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddAutoMapper(typeof(Program));
+
+// ✅ AutoMapper
+builder.Services.AddAutoMapper(typeof(LmsMappingProfile));
+
+// ✅ Repository & Services
 builder.Services.AddScoped<ILMSRepository, LMSRepository>();
-// ✅ DB Context
+builder.Services.AddScoped<IAuthService, AuthService>();
+builder.Services.AddScoped<ILMSService, LMSService>();
+
+// ✅ DbContext
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
 
-// ✅ Identity
-builder.Services.AddIdentity<ApplicationUser, IdentityRole<int>>()
-    .AddEntityFrameworkStores<AppDbContext>()
-    .AddDefaultTokenProviders();
+// ✅ Identity (პრაქტიკული dev პარამეტრებით; შეცვალე პროდზე)
+builder.Services.AddIdentity<ApplicationUser, IdentityRole<int>>(options =>
+{
+    options.Password.RequireDigit = false;
+    options.Password.RequireLowercase = false;
+    options.Password.RequireNonAlphanumeric = false;
+    options.Password.RequireUppercase = false;
+    options.Password.RequiredLength = 6;
+})
+.AddEntityFrameworkStores<AppDbContext>()
+.AddDefaultTokenProviders();
 
-// ✅ Authentication/Authorization
-builder.Services.AddAuthentication();
+// ✅ JWT Authentication
+var jwtKey = builder.Configuration["JWT:Key"];
+if (string.IsNullOrWhiteSpace(jwtKey))
+    throw new InvalidOperationException("JWT:Key არ არის დაყენებული. დაამატე -ში ან User Secrets-ში.");
+
+builder.Services
+    .AddAuthentication(options =>
+    {
+        options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+        options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+    })
+    .AddJwtBearer(options =>
+    {
+        options.RequireHttpsMetadata = true;
+        options.SaveToken = true;
+        options.TokenValidationParameters = new()
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+
+            ValidIssuer = builder.Configuration["JWT:Issuer"],
+            ValidAudience = builder.Configuration["JWT:Audience"],
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey))
+        };
+    });
+
 builder.Services.AddAuthorization();
-
-// ✅ Custom Services
-builder.Services.AddScoped<IAuthService, AuthService>(); // შენი AuthService
-builder.Services.AddScoped<ILMSService, LMSService>();   // შენი LMSService
 
 // ✅ Controllers
 builder.Services.AddControllers();
 
-// ✅ Swagger (JWT-ის მხარდაჭერით)
+// ✅ CORS (Frontend localhost-ზე)
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("FrontendPolicy", policy =>
+    {
+        policy.WithOrigins("http://localhost:4200")
+              .AllowAnyHeader()
+              .AllowAnyMethod()
+              .AllowCredentials();
+    });
+});
+
+// ✅ Swagger + JWT support
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(options =>
 {
-    options.SwaggerDoc("v1", new OpenApiInfo
-    {
-        Title = "LMS API",
-        Version = "v1"
-    });
+    options.SwaggerDoc("v1", new OpenApiInfo { Title = "LMS API", Version = "v1" });
 
-    // 🔐 Add JWT support
-    options.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+    var jwtSecurityScheme = new OpenApiSecurityScheme
     {
-        Name = "Authorization",
-        Type = SecuritySchemeType.ApiKey,
         Scheme = "Bearer",
         BearerFormat = "JWT",
+        Name = "Authorization",
         In = ParameterLocation.Header,
-        Description = "Enter 'Bearer {token}'"
-    });
+        Type = SecuritySchemeType.Http,
+        Description = "წერე: Bearer {token}",
+        Reference = new OpenApiReference
+        {
+            Id = JwtBearerDefaults.AuthenticationScheme,
+            Type = ReferenceType.SecurityScheme
+        }
+    };
 
+    options.AddSecurityDefinition(jwtSecurityScheme.Reference.Id, jwtSecurityScheme);
     options.AddSecurityRequirement(new OpenApiSecurityRequirement
     {
-        {
-            new OpenApiSecurityScheme
-            {
-                Reference = new OpenApiReference { Type = ReferenceType.SecurityScheme, Id = "Bearer" }
-            },
-            Array.Empty<string>()
-        }
+        { jwtSecurityScheme, Array.Empty<string>() }
     });
 });
 
 var app = builder.Build();
 
-// ✅ Seed Roles & Admin (შეამოწმეთ მხოლოდ dev გარემოში გაშვდეს თუ გსურს)
+// ✅ Seed Roles/Admin (გააშვი dev-ზე; პროდზე გააზრებულად გამოიყენე)
 using (var scope = app.Services.CreateScope())
 {
     var services = scope.ServiceProvider;
     await SeedRolesAndAdmin.InitializeAsync(services);
 }
 
-// ✅ Middleware
+// ✅ Middleware pipeline
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
@@ -84,7 +129,9 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
-app.UseAuthentication(); // მნიშვნელოვანია
+app.UseCors("FrontendPolicy");
+
+app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapControllers();

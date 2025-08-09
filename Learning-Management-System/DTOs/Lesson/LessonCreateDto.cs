@@ -2,6 +2,7 @@
 {
     public class LessonCreateDto
     {
+        public int CourseId { get; set; }   // <- დაამატე ეს
         public string Title { get; set; } = string.Empty;
         public string ContentUrl { get; set; } = string.Empty;
     }

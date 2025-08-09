@@ -14,21 +14,30 @@ namespace Learning_Management_System.Services.AuthServiceFile
     {
         private readonly UserManager<ApplicationUser> _userManager;
         private readonly SignInManager<ApplicationUser> _signInManager;
+        private readonly RoleManager<IdentityRole<int>> _roleManager; // ✅ დაამატე
         private readonly IConfiguration _configuration;
 
         public AuthService(
             UserManager<ApplicationUser> userManager,
             SignInManager<ApplicationUser> signInManager,
+            RoleManager<IdentityRole<int>> roleManager, // ✅ დაამატე
             IConfiguration configuration)
         {
             _userManager = userManager;
             _signInManager = signInManager;
+            _roleManager = roleManager; // ✅
             _configuration = configuration;
         }
 
-        // ✅ User registration with role assignment
+        // ✅ Registration
         public async Task<IdentityResult> RegisterAsync(RegisterDto dto)
         {
+            // 0) დუპლიკატის შემოწმება
+            var existing = await _userManager.FindByEmailAsync(dto.Email);
+            if (existing != null)
+                return IdentityResult.Failed(new IdentityError { Description = "User with this email already exists." });
+
+            // 1) იუზერის შექმნა
             var user = new ApplicationUser
             {
                 UserName = dto.Email,
@@ -36,33 +45,79 @@ namespace Learning_Management_System.Services.AuthServiceFile
                 FullName = dto.FullName
             };
 
-            var result = await _userManager.CreateAsync(user, dto.Password);
+            var createResult = await _userManager.CreateAsync(user, dto.Password);
+            if (!createResult.Succeeded)
+                return createResult;
 
-            if (result.Succeeded)
+            // 2) როლის განსაზღვრა (RoleId > Role > "Student")
+            string roleToAssignName = "Student";
+
+            if (dto.RoleId.HasValue)
             {
-                // Assign role (must be pre-created via seeding or RoleManager)
-                await _userManager.AddToRoleAsync(user, dto.Role);
+                var roleEntityById = await _roleManager.FindByIdAsync(dto.RoleId.Value.ToString());
+                if (roleEntityById == null)
+                {
+                    // წაშალე ახლადშექმნილი იუზერი, რომ არ დაგრჩეს როლის გარეშე
+                    await _userManager.DeleteAsync(user);
+                    return IdentityResult.Failed(new IdentityError { Description = $"Role with id '{dto.RoleId}' not found." });
+                }
+                roleToAssignName = roleEntityById.Name!;
+            }
+            else if (!string.IsNullOrWhiteSpace(dto.Role))
+            {
+                roleToAssignName = dto.Role!;
             }
 
-            return result;
+            // 3) თუ ასეთი როლი არ არსებობს — შექმენი
+            if (!await _roleManager.RoleExistsAsync(roleToAssignName))
+            {
+                var roleCreate = await _roleManager.CreateAsync(new IdentityRole<int>(roleToAssignName));
+                if (!roleCreate.Succeeded)
+                {
+                    await _userManager.DeleteAsync(user); // rollback
+                    return IdentityResult.Failed(
+                        roleCreate.Errors.Any()
+                            ? roleCreate.Errors.ToArray()
+                            : new[] { new IdentityError { Description = $"Failed to create role '{roleToAssignName}'." } }
+                    );
+                }
+            }
+
+            // 4) როლის მიბმა იუზერზე
+            var addRoleResult = await _userManager.AddToRoleAsync(user, roleToAssignName);
+            if (!addRoleResult.Succeeded)
+            {
+                await _userManager.DeleteAsync(user); // rollback
+                return IdentityResult.Failed(
+                    addRoleResult.Errors.Any()
+                        ? addRoleResult.Errors.ToArray()
+                        : new[] { new IdentityError { Description = $"Failed to assign role '{roleToAssignName}' to user." } }
+                );
+            }
+
+            // ✅ წარმატება
+            return IdentityResult.Success;
         }
 
-        // ✅ Login logic with role and token generation
+        // ✅ Login
         public async Task<AuthResponseDto?> LoginAsync(LoginDto loginDto)
         {
             var user = await _userManager.FindByEmailAsync(loginDto.Email);
             if (user == null)
                 return new AuthResponseDto { Success = false, Message = "Invalid email or password." };
 
-            var result = await _signInManager.CheckPasswordSignInAsync(user, loginDto.Password, false);
-            if (!result.Succeeded)
+            var pwOk = await _signInManager.CheckPasswordSignInAsync(user, loginDto.Password, false);
+            if (!pwOk.Succeeded)
                 return new AuthResponseDto { Success = false, Message = "Invalid email or password." };
 
             var roles = await _userManager.GetRolesAsync(user);
-            var role = roles.FirstOrDefault() ?? "Student";
+            if (!roles.Any())
+                return new AuthResponseDto { Success = false, Message = "User has no roles assigned." }; // ❗️აღარ ვფარავთ Student-ით
+
+            var role = roles.First();
 
             var (accessToken, expiresAt) = GenerateJwtToken(user, role);
-            var refreshToken = Guid.NewGuid().ToString(); // Placeholder
+            var refreshToken = GenerateRefreshToken();
 
             return new AuthResponseDto
             {
@@ -71,62 +126,75 @@ namespace Learning_Management_System.Services.AuthServiceFile
                 RefreshToken = refreshToken,
                 ExpiresAt = expiresAt,
                 Email = user.Email ?? string.Empty,
-                FullName = user.FullName,
+                FullName = user.FullName ?? string.Empty,
                 Role = role,
                 Message = "Login successful"
             };
         }
 
-        // ✅ (Demo) Refresh Token logic
-        public async Task<AuthResponseDto?> RefreshTokenAsync(RefreshTokenDto dto)
-        {
-            // Dummy refresh - replace with actual refresh token logic
-            var dummyUser = await _userManager.FindByEmailAsync("example@example.com");
-            if (dummyUser == null) return null;
+        // ================== Helpers ==================
 
-            var roles = await _userManager.GetRolesAsync(dummyUser);
-            var role = roles.FirstOrDefault() ?? "Student";
-
-            var (accessToken, expiresAt) = GenerateJwtToken(dummyUser, role);
-
-            return new AuthResponseDto
-            {
-                Success = true,
-                AccessToken = accessToken,
-                RefreshToken = dto.RefreshToken,
-                ExpiresAt = expiresAt,
-                FullName = dummyUser.FullName,
-                Email = dummyUser.Email ?? "",
-                Role = role,
-                Message = "Token refreshed"
-            };
-        }
-
-        // ✅ Generates JWT access token with claims
         private (string token, DateTime expiresAt) GenerateJwtToken(ApplicationUser user, string role)
         {
+            var (issuer, audience, keyString, expiresMinutes) = ReadJwtOptions();
+
             var claims = new List<Claim>
             {
+                new Claim(JwtRegisteredClaimNames.Sub, user.Id.ToString()),
+                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
                 new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
-                new Claim(ClaimTypes.Email, user.Email ?? ""),
-                new Claim(ClaimTypes.Name, user.FullName ?? ""),
+                new Claim(ClaimTypes.Email, user.Email ?? string.Empty),
+                new Claim(ClaimTypes.Name, user.FullName ?? string.Empty),
                 new Claim(ClaimTypes.Role, role)
             };
 
-            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration["Jwt:Key"]!));
+            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(keyString));
             var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
 
-            var expires = DateTime.UtcNow.AddDays(1);
+            var expiresAt = DateTime.UtcNow.AddMinutes(expiresMinutes);
 
             var token = new JwtSecurityToken(
-                issuer: _configuration["Jwt:Issuer"],
-                audience: _configuration["Jwt:Audience"],
+                issuer: issuer,
+                audience: audience,
                 claims: claims,
-                expires: expires,
+                notBefore: DateTime.UtcNow,
+                expires: expiresAt,
                 signingCredentials: creds
             );
 
-            return (new JwtSecurityTokenHandler().WriteToken(token), expires);
+            var accessToken = new JwtSecurityTokenHandler().WriteToken(token);
+            return (accessToken, expiresAt);
+        }
+
+        private static string GenerateRefreshToken() => Guid.NewGuid().ToString("N");
+
+        private (string issuer, string audience, string key, int expiresMinutes) ReadJwtOptions()
+        {
+            var section = _configuration.GetSection("JWT");
+            if (!section.Exists())
+                section = _configuration.GetSection("Jwt");
+
+            var issuer = section["Issuer"];
+            var audience = section["Audience"];
+            var key = section["Key"];
+            var expiresStr = section["ExpiresInMinutes"];
+
+            if (string.IsNullOrWhiteSpace(key))
+                throw new InvalidOperationException("JWT Key is missing from configuration (JWT:Key).");
+            if (string.IsNullOrWhiteSpace(issuer))
+                throw new InvalidOperationException("JWT Issuer is missing from configuration (JWT:Issuer).");
+            if (string.IsNullOrWhiteSpace(audience))
+                throw new InvalidOperationException("JWT Audience is missing from configuration (JWT:Audience).");
+
+            if (!int.TryParse(expiresStr, out var expires))
+                expires = 60;
+
+            return (issuer, audience, key, expires);
+        }
+
+        public Task<AuthResponseDto?> RefreshTokenAsync(RefreshTokenDto dto)
+        {
+            throw new NotImplementedException();
         }
     }
 }
